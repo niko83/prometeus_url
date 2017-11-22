@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import time
 import logging
 import sys
 import traceback
@@ -45,7 +46,7 @@ def create_application():
 
     app = web.Application(loop=current_loop, middlewares=[error_middleware])
 
-    app.router.add_get('/prometeus', prometeus)
+    app.router.add_get('/metrics', metrics)
 
     init_logging()
 
@@ -61,6 +62,7 @@ async def error_middleware(app, handler):
         try:
             return await handler(request)
         except web.HTTPException as ex:
+            logger.warn(request.url)
             return json_error_response("%s. %s." % (ex, ex.text), ex.status_code)
         except Exception as e:
             logger.exception("Unknown error.")
@@ -76,10 +78,11 @@ def _metric(metric_name, val, **labels):
             labels_list.append('%s="%s"' % (name, l_val))
         labels_str = "{" + ','.join(labels_list) + "}"
 
-    return "%s%s %s" % (metric_name, labels_str, val)
+    return "%s%s %s %s000" % (metric_name, labels_str, val, int(time.time()))
 
 
-async def prometeus(request):
+async def metrics(request):
+    global counter
 
     data = [
         _metric("disc_busy", disk_busy("sda"), dev="sda"),
