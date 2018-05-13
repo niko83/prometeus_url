@@ -1,0 +1,18 @@
+version: '2'
+volumes:
+  prometheus_data:
+services:
+  prometheus:
+      container_name: system_metrics_prom
+      image: prom/prometheus
+      volumes:
+          - prometheus_data:/prometheus
+          - /home/root/prometheus.yml:/etc/prometheus/prometheus.yml 
+      network_mode: host
+
+  grafana:
+      container_name: system_metrics_grafana
+      image: grafana/grafana
+      volumes:
+          - /var/lib/grafana:/var/lib/grafana 
+      network_mode: host
