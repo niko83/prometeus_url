@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #-*- coding: utf-8 -*-
-import argparse
+import os
 import asyncio
 import json
 import time
@@ -8,28 +8,74 @@ import logging
 import sys
 import traceback
 from functools import partial
+import aiohttp
 
 from aiohttp import web
 from aiohttp.web import json_response as aiohttp_json_response, Response
 from linux_metrics import (
-    disk_busy, disk_reads_writes_persec, disk_usage, cpu_percents,
-    load_avg, procs_blocked, procs_running
+    disk_busy, disk_usage, cpu_percents,
+    load_avg, procs_blocked, procs_running, rx_tx_bytes,
+    disk_reads_writes,
 )
+import settings
+
+
+def mem_stats():
+    mem = {}
+
+    with open('/proc/meminfo') as f:
+        for line in f:
+            if line.startswith('MemTotal:'):
+                mem['total'] = int(line.split()[1]) * 1024
+            elif line.startswith('Active: '):
+                mem['active'] = int(line.split()[1]) * 1024
+            elif line.startswith('MemFree:'):
+                mem['free'] = (int(line.split()[1]) * 1024)
+            elif line.startswith('Cached:'):
+                mem['cached'] = (int(line.split()[1]) * 1024)
+            elif line.startswith('Buffers: '):
+                mem['buffers'] = (int(line.split()[1]) * 1024)
+            elif line.startswith('SwapTotal: '):
+                mem['swap_total'] = (int(line.split()[1]) * 1024)
+            elif line.startswith('SwapFree: '):
+                mem['swap_free'] = (int(line.split()[1]) * 1024)
+
+    used = mem['total'] - mem['free'] - mem['cached'] - mem['buffers']
+    cached = mem['cached']
+    buffers = mem['buffers']
+    free = mem['free']
+
+    return (used, cached, buffers, free)
 
 
 json_dumps = partial(json.dumps, indent=2, sort_keys=True)
 
-logger = logging.getLogger("prometeus_url")
+logger = logging.getLogger("prometheus_url")
 
 current_app = None
 current_loop = asyncio.get_event_loop()
 
 
 def init_logging():
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.INFO)
-    stdout_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logger.addHandler(stdout_handler)
+
+    logger = logging.getLogger("prometheus_url")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [PID:{0}] [%(name)s.%(funcName)s]: %(message)s".format(os.getpid())
+    ))
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.ERROR)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [PID:{0}] [%(name)s.%(funcName)s]: %(message)s".format(os.getpid())
+    ))
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
 
 
 def json_error_response(message, status):
@@ -42,13 +88,14 @@ def json_error_response(message, status):
 
 
 def create_application():
-    current_loop.set_debug(True)
+    if settings.DEBUG:
+        current_loop.set_debug(True)
+
+    init_logging()
 
     app = web.Application(loop=current_loop, middlewares=[error_middleware])
 
     app.router.add_get('/metrics', metrics)
-
-    init_logging()
 
     global current_app
     current_app = app
@@ -84,45 +131,44 @@ def _metric(metric_name, val, **labels):
 async def metrics(request):
     global counter
 
+    logger.info(request)
+
     data = [
-        _metric("disc_busy", disk_busy("sda"), dev="sda"),
         _metric("load_average", load_avg()[0]),
         _metric("procs_blocked", procs_blocked()),
         _metric("procs_running", procs_running()),
         _metric("cpu", 100 - cpu_percents()["idle"]),
-        #  list(map(lambda x: x/1024/1024/1024, mem_stats())),
-
-        #  net_stats_ifconfig(),
-        #  rx_tx_bits(),
-        #  rx_tx_bytes(),
-        #  rx_tx_dump(),
     ]
 
-    #  reads, writes = disk_reads_writes("sda")
-    #  data.append(_metric("disc_sum", reads, dev="sda", operation="reads"))
-    #  data.append(_metric("disc_sum", writes, dev="sda", operation="writes"))
+    for interface in settings.NETWORK_INTERFACES:
+        rx_tx = list(map(lambda x: x/1024/1024, rx_tx_bytes(interface)))
+        data.append(_metric("network", rx_tx[0], type="rx", interface=interface))
+        data.append(_metric("network", rx_tx[1], type="tx", interface=interface))
 
-    reads, writes = disk_reads_writes_persec("sda")
-    data.append(_metric("disc_persec", reads, dev="sda", operation="reads"))
-    data.append(_metric("disc_persec", writes, dev="sda", operation="writes"))
+    for dev in settings.DISKS:
+        data.append(_metric("disk_busy", disk_busy(dev), dev=dev))
 
-    disc_path = "/dev/mapper/mint--vg-root"
-    disc = disk_usage(disc_path)
-    data.append(_metric("disc_space", disc[1]/1024/1024, dev=disc_path, type="size"))
-    data.append(_metric("disc_space", disc[2]/1024/1024, dev=disc_path, type="used"))
-    data.append(_metric("disc_space", disc[3]/1024/1024, dev=disc_path, type="free"))
+        reads, writes = disk_reads_writes(dev)
+        data.append(_metric("disk_sum", reads, dev=dev, operation="reads"))
+        data.append(_metric("disk_sum", writes, dev=dev, operation="writes"))
+
+        disk = disk_usage("/dev/" + dev)
+        data.append(_metric("disk_space", disk[1]/1024/1024, dev=dev, type="size"))
+        data.append(_metric("disk_space", disk[2]/1024/1024, dev=dev, type="used"))
+        data.append(_metric("disk_space", disk[3]/1024/1024, dev=dev, type="free"))
+
+    ram = list(map(lambda x: x/1024/1024/1024, mem_stats()))
+
+    data.append(_metric("ram", ram[0], type="used"))
+    data.append(_metric("ram", ram[1], type="cached"))
+    data.append(_metric("ram", ram[2], type="buffers"))
+    data.append(_metric("ram", ram[3], type="free"))
 
     data = "\n".join(data)
 
     return Response(text=data, status=200, content_type="text/plain")
 
 
-parser = argparse.ArgumentParser(description="PrometeusUrl")
-parser.add_argument('--host', default="127.0.0.1")
-parser.add_argument('--port', type=int, default=8080)
-
-args = parser.parse_args()
-
 app = create_application()
 
-web.run_app(app, port=args.port, host=args.host)
+web.run_app(app, port=settings.PORT, host=settings.HOST)
